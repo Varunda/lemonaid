@@ -1,0 +1,5 @@
+﻿[Bb]in/
+[Oo]bj/
+.config.json
+secrets.json
+.vs/
