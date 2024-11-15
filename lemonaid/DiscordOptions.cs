@@ -28,5 +28,9 @@ namespace lemonaid {
         /// </summary>
         public string Token { get; set; } = "aaa";
 
+        public int ReminderDelaySeconds { get; set; } = 60 * 60 * 3;
+
+        public int SnoozeDelaySeconds { get; set; } = 60 * 60 * 1;
+
     }
 }

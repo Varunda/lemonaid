@@ -13,6 +13,9 @@ using lemonaid.Code.Extensions;
 using DSharpPlus.Exceptions;
 using lemonaid.Models;
 using Microsoft.Extensions.FileProviders;
+using DSharpPlus.SlashCommands;
+using DSharpPlus.SlashCommands.EventArgs;
+using lemonaid.Discord;
 
 namespace lemonaid.Services {
 
@@ -23,20 +26,19 @@ namespace lemonaid.Services {
         private readonly DiscordWrapper _Discord;
         private readonly PluralKitApi _pkApi;
         private IOptions<DiscordOptions> _DiscordOptions;
+        private readonly ReminderRepository _ReminderRepository;
 
         private bool _IsConnected = false;
         private const string SERVICE_NAME = "discord";
 
         private Dictionary<ulong, ulong> _CachedMembership = new();
 
-        private readonly TimeSpan REMINDER_DELAY = TimeSpan.FromSeconds(5);
-        private readonly TimeSpan SNOOZE_DELAY = TimeSpan.FromSeconds(2);
-
-        private readonly TimeSpan DELETE_PING_DELAY = TimeSpan.FromSeconds(5);
+        private readonly TimeSpan REMINDER_DELAY;
+        private readonly TimeSpan SNOOZE_DELAY;
 
         private const ulong PK_APP_ID = 466378653216014359;
 
-        private Dictionary<string, Reminder> _Reminders = new();
+        private SlashCommandsExtension _SlashCommands;
 
         private ulong _ChannelId {
             get { return _DiscordOptions.Value.ChannelId; }
@@ -48,11 +50,16 @@ namespace lemonaid.Services {
 
         public DiscordService(ILogger<DiscordService> logger, ILoggerFactory loggerFactory,
             IOptions<DiscordOptions> discordOptions, IServiceProvider services,
-            PluralKitApi pkApi, DiscordWrapper discord) {
+            PluralKitApi pkApi, DiscordWrapper discord, 
+            ReminderRepository reminderRepository) {
 
             _Logger = logger;
 
             _DiscordOptions = discordOptions;
+
+            REMINDER_DELAY = TimeSpan.FromSeconds(_DiscordOptions.Value.ReminderDelaySeconds);
+            SNOOZE_DELAY = TimeSpan.FromSeconds(_DiscordOptions.Value.SnoozeDelaySeconds);
+            _Logger.LogInformation($"settings [reminder={REMINDER_DELAY}] [snooze={SNOOZE_DELAY}]");
 
             _Discord = discord;
             _pkApi = pkApi;
@@ -65,6 +72,15 @@ namespace lemonaid.Services {
             _Discord.Get().MessageReactionAdded += Reaction_Added;
             _Discord.Get().MessageDeleted += Message_Deleted;
             _Discord.Get().ComponentInteractionCreated += ComponentInteraction_Created;
+
+            _SlashCommands = _Discord.Get().UseSlashCommands(new SlashCommandsConfiguration() {
+                Services = services
+            });
+
+            _SlashCommands.SlashCommandErrored += Slash_Command_Errored;
+
+            _SlashCommands.RegisterCommands<ReminderSlashCommand>(_GuildId);
+            _ReminderRepository = reminderRepository;
         }
 
         public async override Task StartAsync(CancellationToken cancellationToken) {
@@ -83,17 +99,10 @@ namespace lemonaid.Services {
                 try {
                     await Task.Delay(5000, stoppingToken);
 
-                    foreach (KeyValuePair<string, Reminder> iter in _Reminders) {
-                        Reminder reminder = iter.Value;
+                    List<Reminder> toSend = await _ReminderRepository.GetRemindersToSend();
 
-                        if (DateTimeOffset.UtcNow < reminder.SendAfter || reminder.Sent == true) {
-                            //_Logger.LogInformation($"not sending reminder: not enough time passed [send after={reminder.SendAfter:u}]");
-                            continue;
-                        }
-
-                        _Logger.LogInformation($"sending reminder [message ID={reminder.MessageID}]");
-                        reminder.Sent = true;
-                        await Ping(reminder);
+                    foreach (Reminder r in toSend) {
+                        await Ping(r);
                     }
                 } catch (Exception ex) when (stoppingToken.IsCancellationRequested == false) {
                     _Logger.LogError(ex, "error sending message");
@@ -108,6 +117,8 @@ namespace lemonaid.Services {
             ulong? guildID = null;
             if (args.Guild == null) {
                 guildID = args.Channel.GuildId;
+            } else {
+                guildID = args.Guild.Id;
             }
             if (args.Channel == null) {
                 _Logger.LogWarning("channel is null?");
@@ -119,10 +130,13 @@ namespace lemonaid.Services {
             }
 
             string key = $"{guildID}.{args.Channel.Id}.{args.Message.Author.Id}";
-            if (_Reminders.ContainsKey(key)) {
-                _Logger.LogInformation($"removed reminder [key={key}]");
+            PkMessage? pkMsg = await _pkApi.GetMessage(args.Message.Id);
+            if (pkMsg == null) {
+                _Logger.LogInformation($"message that was a reminder deleted [key={key}]");
+                await _ReminderRepository.Remove(key);
+            } else {
+                _Logger.LogInformation($"message deleted by pk proxy, not removing reminder [key={key}]");
             }
-            _Reminders.Remove(key);
         }
 
         private async Task Message_Created(DiscordClient sender, MessageCreateEventArgs args) {
@@ -145,7 +159,7 @@ namespace lemonaid.Services {
             r.SendAfter = args.Message.Timestamp + REMINDER_DELAY;
 
             if (args.Message.ApplicationId == PK_APP_ID) {
-                _Logger.LogInformation($"pk message sent");
+                _Logger.LogInformation($"pk message sent [msg id={args.Message.Id}]");
                 PkMessage? msg = await _pkApi.GetMessage(args.Message.Id);
                 if (msg == null) {
                     _Logger.LogWarning($"missing pk message [msg id={args.Message.Id}]");
@@ -154,16 +168,7 @@ namespace lemonaid.Services {
                 }
             }
 
-            string key = $"{r.GuildID}.{r.ChannelID}.{r.TargetUserID}";
-
-            if (_Reminders.ContainsKey(key)) {
-                _Logger.LogInformation($"pushing reminder back [key={key}] [send after={r.SendAfter:u}]");
-            } else {
-                _Logger.LogInformation($"reminder added [author={args.Author.Id}/{args.Author.Username}] [timestamp={args.Message.Timestamp:u}] [send after={r.SendAfter:u}]");
-            }
-            _Reminders[key] = r;
-
-            return;
+            await _ReminderRepository.Upsert(r);
         }
 
         private async Task Reaction_Added(DiscordClient sender, MessageReactionAddEventArgs args) {
@@ -200,14 +205,15 @@ namespace lemonaid.Services {
 
                 string key = $"{args.Guild.Id}.{args.Channel.Id}.{parts[1]}";
 
-                if (_Reminders.ContainsKey(key)) {
+                Reminder? r = await _ReminderRepository.GetByKey(key);
+                if (r != null) {
                     if (parts[0] == "@snooze") {
-                        _Reminders[key].SendAfter = DateTimeOffset.UtcNow + SNOOZE_DELAY;
-                        _Reminders[key].Sent = false;
+                        r.SendAfter = DateTimeOffset.UtcNow + SNOOZE_DELAY;
+                        r.Sent = false;
+                        await _ReminderRepository.Upsert(r);
                         _Logger.LogInformation($"snoozing reminder for 1h [key={key}]");
                     } else if (parts[0] == "@remove") {
-                        _Reminders.Remove(key);
-                        _Logger.LogInformation($"removing reminder [key={key}]");
+                        await _ReminderRepository.Remove(key);
                     } else {
                         _Logger.LogWarning($"unchecked command [command={parts[0]}]");
                         return;
@@ -240,6 +246,7 @@ namespace lemonaid.Services {
 
             DiscordMessageBuilder builder = new();
             builder.WithReply(reminder.MessageID, true);
+            builder.WithContent($"<@{reminder.TargetUserID}>");
             builder.AddComponents(
                 new DiscordButtonComponent(ButtonStyle.Primary, $"@snooze.{reminder.TargetUserID}", "Snooze (1h)"),
                 new DiscordButtonComponent(ButtonStyle.Danger, $"@remove.{reminder.TargetUserID}", "Remove")
@@ -254,13 +261,6 @@ namespace lemonaid.Services {
             builder.AddMention(new UserMention(reminder.TargetUserID));
 
             DiscordMessage msg = await _Discord.Get().SendMessageAsync(channel, builder);
-            //await msg.CreateReactionAsync(DiscordEmoji.FromName(_Discord.Get(), ":x:"));
-            await Task.Delay(DELETE_PING_DELAY);
-            try {
-                //await msg.DeleteAsync();
-            } catch (NotFoundException) {
-                _Logger.LogInformation($"message was deleted before bot deleted it");
-            }
         }
 
         /// <summary>
@@ -413,6 +413,63 @@ namespace lemonaid.Services {
             }
 
             return s;
+        }
+
+        /// <summary>
+        ///     Event handler for when a slash command fails
+        /// </summary>
+        /// <param name="ext"></param>
+        /// <param name="args"></param>
+        /// <returns></returns>
+        private async Task Slash_Command_Errored(SlashCommandsExtension ext, SlashCommandErrorEventArgs args) {
+            if (args.Exception is SlashExecutionChecksFailedException failedCheck) {
+                string feedback = "Check failed:\n";
+
+                foreach (SlashCheckBaseAttribute check in failedCheck.FailedChecks) {
+                    /*
+                    if (check is RequiredRoleSlashAttribute role) {
+                        _Logger.LogWarning($"{args.Context.User.GetDisplay()} attempted to use {args.Context.CommandName},"
+                            + $" but lacks the Discord roles: {string.Join(", ", role.Roles)}");
+                        feedback += $"You lack a required role: {string.Join(", ", role.Roles)}";
+                    } else {
+                        feedback += $"Unchecked check type: {check.GetType()}";
+                        _Logger.LogError($"Unchecked check type: {check.GetType()}");
+                    }
+                    */
+                    feedback += $"Unchecked check type: {check.GetType()}";
+                    _Logger.LogError($"Unchecked check type: {check.GetType()}");
+                }
+
+                await args.Context.CreateImmediateText(feedback, true);
+
+                return;
+            }
+
+            _Logger.LogError(args.Exception, $"error executing slash command: {args.Context.CommandName}");
+
+            if (args.Exception is BadRequestException badRequest) {
+                _Logger.LogError($"errors in request [url={badRequest.WebRequest.Url}] [errors={badRequest.Errors}]");
+            }
+
+            try {
+                // if the response has already started, this won't be null, indicating to instead update the response
+                DiscordMessage? msg = null;
+                try {
+                    msg = await args.Context.GetOriginalResponseAsync();
+                } catch (NotFoundException) {
+                    msg = null;
+                }
+
+                if (msg == null) {
+                    // if it is null, then no respons has been started, so one is created
+                    // if you attempt to create a response for one that already exists, then a 400 is thrown
+                    await args.Context.CreateImmediateText($"Error executing slash command: {args.Exception.Message}", true);
+                } else {
+                    await args.Context.EditResponseText($"Error executing slash command: {args.Exception.Message}");
+                }
+            } catch (Exception ex) {
+                _Logger.LogError(ex, $"error sending error message to Discord");
+            }
         }
 
     }

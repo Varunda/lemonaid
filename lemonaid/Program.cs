@@ -25,8 +25,10 @@ namespace lemonaid {
             builder.ConfigureServices((context, services) => {
                 services.Configure<DiscordOptions>(context.Configuration.GetSection("Discord"));
 
+                services.AddMemoryCache();
                 services.AddSingleton<DiscordWrapper>();
                 services.AddSingleton<PluralKitApi>();
+                services.AddSingleton<ReminderRepository>();
                 services.AddHostedService<DiscordService>();
 
                 services.AddHostedService<App>();
