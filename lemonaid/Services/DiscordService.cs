@@ -40,8 +40,8 @@ namespace lemonaid.Services {
 
         private SlashCommandsExtension _SlashCommands;
 
-        private ulong _ChannelId {
-            get { return _DiscordOptions.Value.ChannelId; }
+        private List<ulong> _ChannelIds {
+            get { return _DiscordOptions.Value.ChannelIds; }
         }
 
         private ulong _GuildId {
@@ -140,7 +140,7 @@ namespace lemonaid.Services {
         }
 
         private async Task Message_Created(DiscordClient sender, MessageCreateEventArgs args) {
-            if (args.Channel.Id != _ChannelId) {
+            if (_ChannelIds.Contains(args.Channel.Id) == false) {
                 return;
             }
             if (args.Guild?.Id != _GuildId) {

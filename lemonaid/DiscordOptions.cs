@@ -11,7 +11,7 @@ namespace lemonaid {
         /// <summary>
         ///     What channel Spark will send messages to
         /// </summary>
-        public ulong ChannelId { get; set; }
+        public List<ulong> ChannelIds { get; set; } = [];
 
         /// <summary>
         ///     What Guild Spark is at "home" in
