@@ -31,7 +31,7 @@ namespace lemonaid {
             if (_DiscordOptions.Value.GuildId == 0) {
                 throw new ArgumentException($"missing Discord:GuildId. set this value in secrets.json");
             }
-            if (_DiscordOptions.Value.ChannelId == 0) {
+            if (_DiscordOptions.Value.ChannelIds.Count == 0) {
                 throw new ArgumentException($"missing Discord:ChannelId. set this value in secrets.json");
             }
 
