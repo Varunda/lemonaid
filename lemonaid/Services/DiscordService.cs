@@ -33,9 +33,13 @@ namespace lemonaid.Services {
 
         private Dictionary<ulong, ulong> _CachedMembership = new();
 
-        private readonly TimeSpan REMINDER_DELAY;
+        private readonly TimeSpan SELF_REMINDER_DELAY;
+        private readonly TimeSpan OTHER_REMINDER_DELAY;
         private readonly TimeSpan SNOOZE_DELAY;
 
+        /// <summary>
+        ///     ID of the pluralkit application
+        /// </summary>
         private const ulong PK_APP_ID = 466378653216014359;
 
         private SlashCommandsExtension _SlashCommands;
@@ -48,6 +52,10 @@ namespace lemonaid.Services {
             get { return _DiscordOptions.Value.GuildId; }
         }
 
+        private ulong _TargetUserId {
+            get { return _DiscordOptions.Value.TargetUserId; }
+        }
+
         public DiscordService(ILogger<DiscordService> logger, ILoggerFactory loggerFactory,
             IOptions<DiscordOptions> discordOptions, IServiceProvider services,
             PluralKitApi pkApi, DiscordWrapper discord, 
@@ -57,9 +65,10 @@ namespace lemonaid.Services {
 
             _DiscordOptions = discordOptions;
 
-            REMINDER_DELAY = TimeSpan.FromSeconds(_DiscordOptions.Value.ReminderDelaySeconds);
+            SELF_REMINDER_DELAY = TimeSpan.FromSeconds(_DiscordOptions.Value.SelfReminderDelaySeconds);
+            OTHER_REMINDER_DELAY = TimeSpan.FromSeconds(_DiscordOptions.Value.OtherReminderDelaySeconds);
             SNOOZE_DELAY = TimeSpan.FromSeconds(_DiscordOptions.Value.SnoozeDelaySeconds);
-            _Logger.LogInformation($"settings [reminder={REMINDER_DELAY}] [snooze={SNOOZE_DELAY}]");
+            _Logger.LogInformation($"settings [self reminder={SELF_REMINDER_DELAY}] [other reminder={OTHER_REMINDER_DELAY}] [snooze={SNOOZE_DELAY}]");
 
             _Discord = discord;
             _pkApi = pkApi;
@@ -69,7 +78,6 @@ namespace lemonaid.Services {
             _Discord.Get().ContextMenuInteractionCreated += Generic_Interaction_Created;
             _Discord.Get().GuildAvailable += Guild_Available;
             _Discord.Get().MessageCreated += Message_Created;
-            _Discord.Get().MessageReactionAdded += Reaction_Added;
             _Discord.Get().MessageDeleted += Message_Deleted;
             _Discord.Get().ComponentInteractionCreated += ComponentInteraction_Created;
 
@@ -97,7 +105,7 @@ namespace lemonaid.Services {
 
             while (stoppingToken.IsCancellationRequested == false) {
                 try {
-                    await Task.Delay(5000, stoppingToken);
+                    await Task.Delay(5000, stoppingToken); // check every 5 seconds for reminders to send
 
                     List<Reminder> toSend = await _ReminderRepository.GetRemindersToSend();
 
@@ -113,6 +121,13 @@ namespace lemonaid.Services {
             }
         }
 
+        /// <summary>
+        ///     when a message is removed, delete that reminder, UNLESS it was deleted by pluralkit
+        ///     (we use the pk api to determine if the message was deleted by pk or not)
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="args"></param>
+        /// <returns></returns>
         private async Task Message_Deleted(DiscordClient sender, MessageDeleteEventArgs args) {
             ulong? guildID = null;
             if (args.Guild == null) {
@@ -130,15 +145,27 @@ namespace lemonaid.Services {
             }
 
             string key = $"{guildID}.{args.Channel.Id}.{args.Message.Author.Id}";
+            // if there is a PK message, that means that PK deleted the message,
+            //      so we don't want to delete the reminder
             PkMessage? pkMsg = await _pkApi.GetMessage(args.Message.Id);
             if (pkMsg == null) {
-                _Logger.LogInformation($"message that was a reminder deleted [key={key}]");
                 await _ReminderRepository.Remove(key);
             } else {
                 _Logger.LogInformation($"message deleted by pk proxy, not removing reminder [key={key}]");
             }
         }
 
+        /// <summary>
+        ///     when a message is sent in a channel that is being tracked, we create a reminder.
+        ///     there are 2 types of reminders, reminders from the target user, and to the target user.
+        ///     a reminder from the target user is created if the target user is the one sending the message.
+        ///     in this case, they will be reminded in a much longer delay.
+        ///     if the reminder is from a different user, then a reminder is made for the target user
+        ///     after a shorter delay
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="args"></param>
+        /// <returns></returns>
         private async Task Message_Created(DiscordClient sender, MessageCreateEventArgs args) {
             if (_ChannelIds.Contains(args.Channel.Id) == false) {
                 return;
@@ -146,50 +173,63 @@ namespace lemonaid.Services {
             if (args.Guild?.Id != _GuildId) {
                 return;
             }
-            if (args.Author.Id == sender.CurrentUser.Id) {
+            if (args.Author.Id == sender.CurrentUser.Id) { // ignore messages from this bot
                 return;
             }
 
             Reminder r = new();
             r.MessageID = args.Message.Id;
             r.GuildID = args.Guild.Id;
-            r.TargetUserID = args.Author.Id;
+            r.TargetUserID = _TargetUserId;
             r.ChannelID = args.Channel.Id;
             r.Timestamp = args.Message.Timestamp;
-            r.SendAfter = args.Message.Timestamp + REMINDER_DELAY;
 
+            // depending on the user that sent the message, the reminder delay is different
+            ulong senderID = args.Author.Id;
+
+            // for a pluralkit message, get the user ID of the sender
             if (args.Message.ApplicationId == PK_APP_ID) {
                 _Logger.LogInformation($"pk message sent [msg id={args.Message.Id}]");
                 PkMessage? msg = await _pkApi.GetMessage(args.Message.Id);
                 if (msg == null) {
                     _Logger.LogWarning($"missing pk message [msg id={args.Message.Id}]");
                 } else {
-                    r.TargetUserID = msg.SenderMessageID;
+                    senderID = msg.SenderMessageID;
                 }
+            }
+
+            if (senderID != _TargetUserId) {
+                r.SendAfter = r.Timestamp + OTHER_REMINDER_DELAY;
+            } else {
+                r.SendAfter = r.Timestamp + SELF_REMINDER_DELAY;
+                r.StickySelfReminder = true;
+            }
+
+            string key = $"{r.GuildID}.{r.ChannelID}.{r.TargetUserID}";
+            Reminder? reminder = await _ReminderRepository.GetByKey(key);
+            if (reminder != null && reminder.StickySelfReminder == true) {
+                _Logger.LogInformation($"message is set to stick to self reminder duration [key={key}]");
+                r.SendAfter = r.Timestamp + SELF_REMINDER_DELAY;
+                r.StickySelfReminder = true;
             }
 
             await _ReminderRepository.Upsert(r);
         }
 
-        private async Task Reaction_Added(DiscordClient sender, MessageReactionAddEventArgs args) {
-            _Logger.LogInformation($"reaction added [sender={args.User.Id}] [emoji={args.Emoji.Name}/{args.Emoji.GetDiscordName()}]");
-            if (args.User.Id == sender.CurrentUser.Id) {
-                return;
-            }
-
-            if (args.Message == null || args.Message.Author == null || args.Message.Author.Id != sender.CurrentUser.Id) {
-                return;
-            }
-
-            if (args.Emoji.GetDiscordName() != ":x:") {
-                return;
-            }
-
-            await args.Message.DeleteAsync();
-        }
-
+        /// <summary>
+        ///     handles the button interactions when the reminder is sent (to either snooze or delete the reminder)
+        /// </summary>
+        /// <param name="client"></param>
+        /// <param name="args"></param>
+        /// <returns></returns>
+        /// <exception cref="Exception"></exception>
         private async Task ComponentInteraction_Created(DiscordClient client, ComponentInteractionCreateEventArgs args) {
             _Logger.LogInformation($"comp interaction! [id={args.Id}]");
+
+            if (args.User.Id != _TargetUserId) {
+                await args.Interaction.CreateImmediateText($"this can only be dismissed by @<{_TargetUserId}>", ephemeral: true);
+                return;
+            }
 
             await args.Interaction.CreateDeferred(true);
 
@@ -231,6 +271,11 @@ namespace lemonaid.Services {
             }
         }
 
+        /// <summary>
+        ///     send the reminder
+        /// </summary>
+        /// <param name="reminder"></param>
+        /// <returns></returns>
         private async Task Ping(Reminder reminder) {
             DiscordGuild? guild = await _Discord.Get().TryGetGuild(reminder.GuildID);
             if (guild == null) {
@@ -245,8 +290,8 @@ namespace lemonaid.Services {
             }
 
             DiscordMessageBuilder builder = new();
-            builder.WithReply(reminder.MessageID, true);
-            builder.WithContent($"<@{reminder.TargetUserID}>");
+            builder.WithReply(reminder.MessageID, mention: false);
+            builder.WithContent($"<@{reminder.TargetUserID}>"); // an embed cannot ping, must include the @ outside the embed
             builder.AddComponents(
                 new DiscordButtonComponent(ButtonStyle.Primary, $"@snooze.{reminder.TargetUserID}", "Snooze (1h)"),
                 new DiscordButtonComponent(ButtonStyle.Danger, $"@remove.{reminder.TargetUserID}", "Remove")
@@ -255,7 +300,8 @@ namespace lemonaid.Services {
             DiscordEmbedBuilder embed = new();
             embed.Title = "reminder!";
             embed.Color = DiscordColor.Gold;
-            embed.Description = $"This is a reminder for <@{reminder.TargetUserID}>!";
+            embed.Description = $"This is a reminder for <@{reminder.TargetUserID}>!\n";
+            embed.Description += $"-# original message sent at <t:{reminder.Timestamp.ToUnixTimeSeconds()}:f>";
 
             builder.AddEmbed(embed);
             builder.AddMention(new UserMention(reminder.TargetUserID));
@@ -312,10 +358,11 @@ namespace lemonaid.Services {
         /// <param name="sender"></param>
         /// <param name="args"></param>
         /// <returns></returns>
-        private async Task Client_Ready(DiscordClient sender, ReadyEventArgs args) {
+        private Task Client_Ready(DiscordClient sender, ReadyEventArgs args) {
             _Logger.LogInformation($"Discord client connected");
 
             _IsConnected = true;
+            return Task.CompletedTask;
         }
 
         private Task Guild_Available(DiscordClient sender, GuildCreateEventArgs args) {

@@ -32,6 +32,13 @@ namespace lemonaid.Models {
         public bool Sent { get; set; }
 
         /// <summary>
+        ///     when a reminder is pushed back due to the target user sending a message,
+        ///     all reminders will then be stuck using the self reminder duration,
+        ///     even if the reminder is pushed back due someone else sending a message
+        /// </summary>
+        public bool StickySelfReminder { get; set; }
+
+        /// <summary>
         ///     will a DM be sent as a reminder instead of a ping?
         /// </summary>
         public bool SendDM { get; set; } = false;

@@ -18,15 +18,29 @@ namespace lemonaid.Services {
             _Logger = logger;
         }
 
+        /// <summary>
+        /// insert or update (upsert) a <see cref="Reminder"/><br/>
+        /// 
+        /// In the case of an update, only <see cref="Reminder.SendAfter"/> is updated,
+        ///     and <see cref="Reminder.StickySelfReminder"/> is set to <c>true</c>
+        ///     if <paramref name="reminder"/> has that field as true, but it is not
+        ///     cleared if <paramref name="reminder"/> has that field unset<br/>
+        ///     
+        /// all other fields remain the same
+        /// </summary>
+        /// <param name="reminder"></param>
+        /// <returns></returns>
         public Task Upsert(Reminder reminder) {
             string key = $"{reminder.GuildID}.{reminder.ChannelID}.{reminder.TargetUserID}";
 
             if (_Reminders.ContainsKey(key)) {
                 _Logger.LogInformation($"pushing reminder back [key={key}] [send after={reminder.SendAfter:u}]");
+                _Reminders[key].SendAfter = reminder.SendAfter;
+                _Reminders[key].StickySelfReminder |= reminder.StickySelfReminder;
             } else {
                 _Logger.LogInformation($"reminder added [author={reminder.TargetUserID}] [timestamp={reminder.Timestamp:u}] [send after={reminder.SendAfter:u}]");
+                _Reminders.Add(key, reminder);
             }
-            _Reminders[key] = reminder;
 
             return Task.CompletedTask;
         }
@@ -76,7 +90,8 @@ namespace lemonaid.Services {
         /// <returns></returns>
         public Task Remove(string key) {
             if (_Reminders.ContainsKey(key)) {
-                _Logger.LogInformation($"removed reminder [key={key}]");
+                Reminder? r = _Reminders.GetValueOrDefault(key);
+                _Logger.LogInformation($"removed reminder [key={key}] [send after={r?.SendAfter:u}]");
             }
             _Reminders.Remove(key);
 

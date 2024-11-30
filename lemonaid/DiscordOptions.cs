@@ -28,8 +28,21 @@ namespace lemonaid {
         /// </summary>
         public string Token { get; set; } = "aaa";
 
-        public int ReminderDelaySeconds { get; set; } = 60 * 60 * 3;
+        /// <summary>
+        ///     when a reminder is triggered by the target user's message,
+        ///     how many seconds to delay until sending that reminder?
+        /// </summary>
+        public int SelfReminderDelaySeconds { get; set; } = 60 * 60 * 3;
 
+        /// <summary>
+        ///     when a reminder is triggered by NOT the target user's message,
+        ///     how many seconds to delay until sending that reminder?
+        /// </summary>
+        public int OtherReminderDelaySeconds { get; set; } = 60 * 10;
+
+        /// <summary>
+        ///     if a reminder is snoozed, how many seconds to wait before re-sending the reminder?
+        /// </summary>
         public int SnoozeDelaySeconds { get; set; } = 60 * 60 * 1;
 
     }
